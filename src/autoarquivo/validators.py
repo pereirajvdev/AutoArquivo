@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,45 @@ def parse_period(inicio: Any, fim: Any) -> tuple[int, int]:
     if start > end:
         raise ValidationError(f"O ano inicial ({start}) não pode ser maior que o ano final ({end}).")
     return start, end
+
+
+# ----------------------------------------------------------------------- datas
+_DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%Y/%m/%d")
+
+
+def parse_date(raw: Any, label: str = "Data") -> date:
+    """Converte o conteúdo de uma célula em ``date``.
+
+    Aceita células de data do Excel (``datetime``/``date``) e texto
+    (``dd/mm/aaaa``, ``dd/mm/aa``, ``dd-mm-aaaa``, ``dd.mm.aaaa``, ``aaaa-mm-dd``),
+    com ou sem hora. Números puros são recusados de propósito: um "2019"
+    (formato antigo, só ano) seria lido como um dia qualquer de 1905.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise ValidationError(f"Informe a {label.lower()}.")
+    result: date | None = None
+    if isinstance(raw, datetime):
+        result = raw.date()
+    elif isinstance(raw, date):
+        result = raw
+    elif isinstance(raw, str):
+        text = re.split(r"[ T]", raw.strip(), maxsplit=1)[0]
+        for fmt in _DATE_FORMATS:
+            try:
+                result = datetime.strptime(text, fmt).date()
+                break
+            except ValueError:
+                continue
+    if result is None:
+        raise ValidationError(
+            f"{label} inválida: '{raw}'. Use uma data do Excel ou o formato dd/mm/aaaa."
+        )
+    if not YEAR_MIN <= result.year <= YEAR_MAX:
+        raise ValidationError(
+            f"{label} fora do intervalo permitido ({YEAR_MIN} a {YEAR_MAX}): "
+            f"{result.strftime('%d/%m/%Y')}."
+        )
+    return result
 
 
 # ----------------------------------------------------------------------- nomes

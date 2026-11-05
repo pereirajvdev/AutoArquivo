@@ -1,9 +1,16 @@
 """Leitura e interpretação de planilhas Excel (openpyxl), sem dependência de Qt.
 
-O reconhecimento de colunas é tolerante: ignora acentos, caixa, espaços e
-pontuação ("Matrícula", "MATRICULA", "Nº Matrícula", "Ano Inicial", "ano_fim"...).
-Se mais de uma coluna puder representar o mesmo campo, a leitura é recusada
-em vez de "chutar" - a identificação precisa ser segura.
+Planilha de vínculos (``read_registros``) - formato fixo, primeira aba::
+
+    | A: Matrícula | B: Data inicial | C: Data final |
+    | 22057        | 02/10/2017      | 16/06/2018    |
+
+O cabeçalho e as linhas sem matrícula numérica são ignorados; linhas vazias
+também. A leitura é em fluxo (somente colunas A a C, linha a linha).
+
+Planilha de nomes (``read_nomes``): o reconhecimento da coluna é tolerante a
+acentos, caixa e pontuação; se houver ambiguidade, a leitura é recusada em vez
+de "chutar".
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 from zipfile import BadZipFile
 
 from openpyxl import load_workbook
@@ -22,9 +29,8 @@ from .models import Registro
 from .validators import (
     ValidationError,
     name_key,
-    normalize_matricula,
     normalize_name,
-    parse_period,
+    parse_date,
     strip_accents,
 )
 
@@ -62,8 +68,8 @@ class SheetPreview:
 
 
 # ------------------------------------------------------------------ abertura
-def _open_sheets(path_like: str | Path) -> list[tuple[str, list[list[Any]]]]:
-    """Lê todas as abas visíveis: ``[(nome_da_aba, linhas), ...]``."""
+def _open_workbook(path_like: str | Path):
+    """Valida o caminho e abre o arquivo em modo leitura (o chamador deve fechá-lo)."""
     path = Path(str(path_like).strip())
     try:
         exists = path.exists()
@@ -95,7 +101,13 @@ def _open_sheets(path_like: str | Path) -> list[tuple[str, list[list[Any]]]]:
         raise SpreadsheetError(f"Não foi possível ler a planilha:\n{path}\n{exc}") from exc
     except Exception as exc:  # noqa: BLE001 - openpyxl pode lançar vários tipos
         raise SpreadsheetError(f"Erro inesperado ao abrir a planilha:\n{path}\n{exc}") from exc
+    return workbook
 
+
+def _open_sheets(path_like: str | Path) -> list[tuple[str, list[list[Any]]]]:
+    """Lê todas as abas visíveis: ``[(nome_da_aba, linhas), ...]``."""
+    path = Path(str(path_like).strip())
+    workbook = _open_workbook(path)
     sheets: list[tuple[str, list[list[Any]]]] = []
     try:
         for ws in workbook.worksheets:
@@ -127,97 +139,64 @@ def _cell(row: list[Any], col: int | None) -> Any:
     return row[col] if col is not None and col < len(row) else None
 
 
-Matcher = Callable[[str], bool]
-
-
-def _is_matricula(h: str) -> bool:
-    return bool(re.fullmatch(r"(n|no|nr|num|numero)?(matr|mat)", h)) or "matricula" in h
-
-
-_IS_INICIO = re.compile(r"(ano)?(ini|inicio|inicial|de|desde)(ano)?")
-_IS_FIM = re.compile(r"(ano)?(fim|final|fin|ate|termino)(ano)?")
-
-REGISTRO_MATCHERS: Mapping[str, Matcher] = {
-    "matricula": _is_matricula,
-    "inicio": lambda h: bool(_IS_INICIO.fullmatch(h)),
-    "fim": lambda h: bool(_IS_FIM.fullmatch(h)),
-    "ano": lambda h: bool(re.fullmatch(r"anos?", h)),
-}
-
-
-def _find_header(
-    rows: list[list[Any]],
-    matchers: Mapping[str, Matcher],
-    is_valid: Callable[[Mapping[str, list[int]]], bool],
-) -> tuple[int, dict[str, list[int]]] | None:
-    """Localiza a linha de cabeçalho com mais campos reconhecidos."""
-    best: tuple[int, dict[str, list[int]]] | None = None
-    for idx, row in enumerate(rows[:HEADER_SEARCH_ROWS]):
-        found: dict[str, list[int]] = {}
-        for col, value in enumerate(row):
-            h = _norm_header(value)
-            if not h:
-                continue
-            for name, matcher in matchers.items():
-                if matcher(h):
-                    found.setdefault(name, []).append(col)
-                    break
-        if found and is_valid(found) and (best is None or len(found) > len(best[1])):
-            best = (idx, found)
-    return best
-
-
-def _single_column(found: Mapping[str, list[int]], name: str, rows: list[list[Any]], hdr: int) -> int:
-    cols = found[name]
-    if len(cols) > 1:
-        titles = ", ".join(f"'{rows[hdr][c]}'" for c in cols)
-        raise SpreadsheetError(
-            f"Há mais de uma coluna que pode representar '{name}' ({titles}). "
-            "Deixe apenas uma na planilha ou renomeie as demais."
-        )
-    return cols[0]
-
-
 # ------------------------------------------------------------------ registros
+def _matricula_int(raw: Any) -> int | None:
+    """Matrícula como inteiro (como ``int(...)`` da leitura de referência) ou None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def read_registros(path: str | Path) -> RegistrosImport:
-    """Lê matrícula / ano inicial / ano final.
+    """Lê os vínculos: matrícula (A), data inicial (B) e data final (C).
 
-    Aceita também uma única coluna "Ano" (equivale a início = fim) e ano final
-    em branco (ano único).
+    Usa a primeira aba. Os scripts externos trabalham com anos, então cada
+    vínculo vira ``Registro(matrícula, ano_inicial, ano_final)``.
+
+    * linha vazia: ignorada; sem matrícula numérica (inclui o cabeçalho): ignorada;
+    * data ausente/inválida ou início posterior ao fim: erro com o número da linha.
     """
-    sheets = _open_sheets(path)
-
-    def valid(found: Mapping[str, list[int]]) -> bool:
-        return "matricula" in found and ("inicio" in found or "ano" in found)
-
-    for title, rows in sheets:
-        located = _find_header(rows, REGISTRO_MATCHERS, valid)
-        if located is None:
-            continue
-        hdr, found = located
-        col_mat = _single_column(found, "matricula", rows, hdr)
-        if "inicio" in found:
-            col_ini = _single_column(found, "inicio", rows, hdr)
-            col_fim = _single_column(found, "fim", rows, hdr) if "fim" in found else None
-        else:
-            col_ini = _single_column(found, "ano", rows, hdr)
-            col_fim = None
+    workbook = _open_workbook(path)
+    try:
+        ws = workbook.worksheets[0]
+        reset = getattr(ws, "reset_dimensions", None)
+        if callable(reset):
+            reset()  # corrige arquivos com dimensão declarada incorretamente
 
         registros: list[Registro] = []
         avisos: list[str] = []
         vistos: set[tuple[str, int, int]] = set()
         duplicados = 0
-        for offset, row in enumerate(rows[hdr + 1:], start=hdr + 2):
-            mat_raw, ini_raw, fim_raw = _cell(row, col_mat), _cell(row, col_ini), _cell(row, col_fim)
+        for numero_linha, linha in enumerate(
+            ws.iter_rows(min_col=1, max_col=3, values_only=True), start=1
+        ):
+            mat_raw, ini_raw, fim_raw = (tuple(linha) + (None,) * 3)[:3]
             if _blank(mat_raw) and _blank(ini_raw) and _blank(fim_raw):
                 continue
-            try:
-                matricula = normalize_matricula(mat_raw)
-                inicio, fim = parse_period(ini_raw, fim_raw)
-            except ValidationError as exc:
-                avisos.append(f"Linha {offset}: {str(exc).splitlines()[0]}")
+
+            matricula = _matricula_int(mat_raw)
+            if matricula is None:
+                if numero_linha > 1 and not _blank(mat_raw):  # linha 1 = cabeçalho
+                    avisos.append(f"Linha {numero_linha} ignorada: matrícula inválida ('{mat_raw}').")
                 continue
-            reg = Registro(matricula, inicio, fim)
+
+            try:
+                data_ini = parse_date(ini_raw, "Data inicial")
+                data_fim = parse_date(fim_raw, "Data final")
+            except ValidationError as exc:
+                raise SpreadsheetError(f"Linha {numero_linha}: {exc}") from exc
+            if data_ini > data_fim:
+                raise SpreadsheetError(
+                    f"Data inicial ({data_ini:%d/%m/%Y}) posterior à data final "
+                    f"({data_fim:%d/%m/%Y}) na linha {numero_linha}."
+                )
+
+            reg = Registro(str(matricula), data_ini.year, data_fim.year)
             if reg.chave in vistos:
                 duplicados += 1
                 continue
@@ -227,15 +206,16 @@ def read_registros(path: str | Path) -> RegistrosImport:
         if not registros:
             detalhe = ("\n" + "\n".join(avisos[:5])) if avisos else ""
             raise SpreadsheetError(
-                f"Nenhum registro válido encontrado na aba '{title}'.{detalhe}"
+                "Nenhum vínculo válido encontrado nas colunas A, B e C da aba "
+                f"'{ws.title}'.\nEsperado: Matrícula | Data inicial | Data final.{detalhe}"
             )
-        return RegistrosImport(registros, avisos, duplicados, title)
-
-    raise SpreadsheetError(
-        "Não foi possível identificar as colunas da planilha.\n"
-        "Esperado: 'Matrícula', 'Ano inicial' e 'Ano final' "
-        "(ou uma coluna 'Ano') nas primeiras linhas da planilha."
-    )
+        return RegistrosImport(registros, avisos, duplicados, ws.title)
+    except SpreadsheetError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - erro de leitura no meio do arquivo
+        raise SpreadsheetError(f"Erro ao ler o conteúdo da planilha:\n{exc}") from exc
+    finally:
+        workbook.close()
 
 
 # ---------------------------------------------------------------------- nomes
