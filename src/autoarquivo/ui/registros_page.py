@@ -11,11 +11,23 @@ uma pasta. Ao clicar, o FichaPDFToExcel roda UMA VEZ POR PASTA retornada (nunca
 por varredura), em fila, reutilizando o mesmo painel de execução (log, progresso,
 cancelamento e trava de execução simultânea). A falha de uma pasta não interrompe
 as demais; ao final é exibido um resumo.
+
+Na Ficha, os registros são divididos por ano (``routing.py``): 2009 em diante vai
+ao AutoFicha e 2008 e anteriores ao JMSFicha. Os dois scripts compartilham o mesmo
+contrato de argumentos e de retorno e rodam em sequência (JMSFicha primeiro), cada
+um só se houver registros para ele. Se qualquer etapa falhar, a geração NÃO é
+considerada concluída e o botão do Excel permanece bloqueado. Os retornos válidos
+são unidos (sem pastas repetidas) para a etapa do Excel.
+
+``--pasta`` na linha de comando (``apply_pasta_inicial``) preenche "Pasta específica"
+e libera "Gerar Excel das Fichas" para essa pasta, sem executar o AutoFicha.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QRegularExpression, Qt, QTimer
@@ -34,7 +46,7 @@ from PySide6.QtWidgets import (
 
 from ..commands import build_ficha_excel_args, build_registros_args
 from ..config import FICHA_EXCEL_KEY, ModuleSpec
-from ..ficha_flow import EXCEL_ENABLED_STATES, ExcelBatch, FichaState
+from ..ficha_flow import EXCEL_ENABLED_STATES, ExcelBatch, FichaState, FichaStep
 from ..ficha_result import (
     FichaResult,
     FichaResultError,
@@ -44,6 +56,7 @@ from ..ficha_result import (
 )
 from ..launch import Launch, resolve_launch
 from ..models import Periodo, Registro, combinar_registros
+from ..routing import ANO_CORTE, dividir_por_ano
 from ..runner import RunResult
 from ..spreadsheet import SpreadsheetError, read_registros
 from ..table_model import ItemTableModel
@@ -83,6 +96,9 @@ _TASK_FICHA = "ficha"
 _TASK_EXCEL = "excel"
 _EXCEL_TASK_NAME = "Gerar Excel das Fichas"
 
+_NOME_ATUAL = "AutoFicha"   # anos >= ANO_CORTE
+_NOME_LEGADO = "JMSFicha"   # anos < ANO_CORTE
+
 
 def _reg_row(r: Registro) -> tuple:
     return (r.matricula, r.inicio, r.fim)
@@ -101,8 +117,11 @@ class RegistrosPage(ModulePage):
         self._closing = False                  # painel sendo fechado: ignora retornos tardios
         self._state = FichaState.AGUARDANDO
         self._state_detail = ""
-        self._return_file: Path | None = None  # JSON temporário do AutoFicha (execução atual)
-        self._pastas: list[Path] = []          # pastas validadas do último retorno
+        self._pipeline: deque[FichaStep] | None = None  # etapas pendentes (None = sem geração de fichas em curso)
+        self._step: FichaStep | None = None    # etapa de ficha em execução
+        self._steps_total = 0
+        self._acc_pastas: list[Path] = []      # pastas retornadas pelas etapas já concluídas
+        self._pastas: list[Path] = []          # pastas validadas do último retorno (ou de --pasta)
         self._batch: ExcelBatch | None = None  # fila do "Gerar Excel" em andamento
         self._excel_launch: Launch | None = None
 
@@ -366,20 +385,22 @@ class RegistrosPage(ModulePage):
     @property
     def is_running(self) -> bool:
         # Também vale entre duas pastas da fila, quando nenhum processo está ativo.
-        return super().is_running or self._batch is not None
+        return super().is_running or self._batch is not None or self._pipeline is not None
 
     def shutdown(self) -> None:
         self._closing = True
         self._batch = None
-        discard(self._return_file)
-        self._return_file = None
+        self._pipeline = None
+        if self._step is not None:
+            discard(self._step.retorno)
+            self._step = None
         super().shutdown()
 
     # ----------------------------------------------------------------- execução
     @guarded
     def _on_start(self) -> None:
-        if self._batch is not None:
-            raise ValidationError("A geração do Excel das fichas está em andamento. Aguarde o término.")
+        if self._batch is not None or self._pipeline is not None:
+            raise ValidationError("Há uma execução em andamento neste módulo. Aguarde o término.")
         servidores = validate_directory(self.ctx.get_servidores(), "Diretório padrão (Servidores)")
         registros = self.consolidado()
         if not registros:
@@ -388,39 +409,104 @@ class RegistrosPage(ModulePage):
                 "antes de executar.")
         pasta_txt = self.sel_pasta.path()
         pasta = validate_directory(pasta_txt, "Pasta específica") if pasta_txt else None
-        launch = resolve_launch(self.ctx.settings, self.spec.key)
 
         if self.btn_excel is None:  # Faltas: fluxo inalterado
+            launch = resolve_launch(self.ctx.settings, self.spec.key)
             args = build_registros_args(servidores, registros, pasta)
             self._task = _TASK_FICHA
             self.run_panel.log.append("info", f"Iniciando '{self.spec.title}' com {len(registros)} registro(s).")
             self.run_panel.execute(launch, args)
             return
 
-        # Ficha: nova execução descarta o resultado anterior e bloqueia o botão até
+        # Ficha: valida todos os scripts necessários ANTES de iniciar qualquer um.
+        steps = self._planejar_fichas(registros, servidores, pasta)
+        # Nova execução descarta o resultado anterior e bloqueia o botão até
         # que um novo retorno válido seja recebido.
-        discard(self._return_file)
-        self._return_file = None
         self._pastas = []
+        self._acc_pastas = []
+        self._steps_total = len(steps)
+        self._pipeline = deque(steps)
+        self.run_panel.log.append(
+            "info", f"Iniciando '{self.spec.title}' com {len(registros)} registro(s) em "
+                    f"{plural(len(steps), 'etapa', 'etapas')}.")
+        self._start_next_step()
+
+    def _planejar_fichas(self, registros: list[Registro], servidores: Path,
+                         pasta: Path | None) -> list[FichaStep]:
+        """Divide os registros por ano e monta as etapas (só as que têm registros), JMSFicha primeiro."""
+        chave_legado = self.spec.legacy_script_key
+        if chave_legado is None:
+            divididos = None
+            partes = [(_NOME_ATUAL, self.spec.key, registros)]
+        else:
+            divididos = dividir_por_ano(registros)
+            partes = [(_NOME_LEGADO, chave_legado, list(divididos.legado)),
+                      (_NOME_ATUAL, self.spec.key, list(divididos.atual))]
+
+        steps: list[FichaStep] = []
+        for nome, chave, regs in partes:
+            if not regs:
+                continue
+            try:
+                launch = resolve_launch(self.ctx.settings, chave)
+            except ValidationError as exc:
+                raise ValidationError(f"{nome}: {exc}") from exc
+            steps.append(FichaStep(nome, chave, regs, launch, servidores, pasta))
+
+        if divididos is not None:
+            self.run_panel.log.append(
+                "info", f"Divisão por ano (corte em {ANO_CORTE}): "
+                        f"{_NOME_LEGADO} ({ANO_CORTE - 1} e anteriores) = {len(divididos.legado)} registro(s); "
+                        f"{_NOME_ATUAL} ({ANO_CORTE} em diante) = {len(divididos.atual)} registro(s).")
+        return steps
+
+    def _start_next_step(self) -> None:
+        """Inicia a próxima etapa da fila; nunca deixa uma exceção travar a interface."""
+        pipeline = self._pipeline
+        if pipeline is None or self._closing or not pipeline:
+            return
         try:
-            retorno = new_return_file()
+            self._launch_step(pipeline.popleft())
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Erro inesperado ao iniciar a etapa de fichas")
+            self.run_panel.log.append("err", f"Erro inesperado: {exc}")
+            self._finish_ficha(FichaState.ERRO, f"Erro inesperado ao iniciar a geração das fichas: {exc}")
+
+    def _launch_step(self, step: FichaStep) -> None:
+        self._step = step
+        posicao = self._steps_total - len(self._pipeline or ())
+        try:
+            step.retorno = new_return_file()
         except OSError as exc:
-            raise ValidationError(f"Não foi possível criar o arquivo temporário de retorno:\n{exc}") from exc
-        self._return_file = retorno
+            self._step = None
+            self._finish_ficha(
+                FichaState.ERRO,
+                f"{step.nome}: não foi possível criar o arquivo temporário de retorno:\n{exc}")
+            return
 
-        args = build_registros_args(servidores, registros, pasta, retorno=retorno)
+        args = build_registros_args(step.servidores, step.registros, step.pasta, retorno=step.retorno)
         self._task = _TASK_FICHA
-        self._set_state(FichaState.PROCESSANDO)
-        self.run_panel.log.append("info", f"Iniciando '{self.spec.title}' com {len(registros)} registro(s).")
+        self._set_state(FichaState.PROCESSANDO, f"Etapa {posicao}/{self._steps_total}: {step.nome}")
+        self.run_panel.log.append(
+            "info", f"[{posicao}/{self._steps_total}] {step.nome}: {len(step.registros)} registro(s) "
+                    f"({self._resumo_anos(step.registros)}).")
         # quiet: o diálogo final depende do conteúdo do retorno, então é exibido por esta página.
-        self.run_panel.execute(launch, args, quiet=True)
+        self.run_panel.execute(step.launch, args, task=step.nome, quiet=True)
 
-        if self._state is FichaState.PROCESSANDO and not self.run_panel.is_running:
+        if self._step is step and not self.run_panel.is_running:
             # O processo não iniciou e nenhum "finished" foi emitido (o RunPanel já avisou o erro).
-            discard(self._return_file)
-            self._return_file = None
+            discard(step.retorno)
+            step.retorno = None
             self._task = ""
-            self._set_state(FichaState.ERRO, "Não foi possível iniciar o AutoFicha.")
+            self._finish_ficha(FichaState.ERRO, f"Não foi possível iniciar o {step.nome}.", dialogs=False)
+
+    @staticmethod
+    def _resumo_anos(registros: list[Registro], limite: int = 8) -> str:
+        itens = [f"{r.matricula}: {r.inicio}" if r.inicio == r.fim else f"{r.matricula}: {r.inicio}-{r.fim}"
+                 for r in registros[:limite]]
+        if len(registros) > limite:
+            itens.append(f"… +{len(registros) - limite}")
+        return "; ".join(itens)
 
     def _on_running_changed(self, running: bool) -> None:
         self._busy = running
@@ -431,18 +517,51 @@ class RegistrosPage(ModulePage):
         if self._closing:
             return
         if task == _TASK_FICHA and self.btn_excel is not None:
-            self._on_ficha_finished(result)
+            self._on_ficha_step_finished(result)
         elif task == _TASK_EXCEL:
             self._on_excel_item_finished(result)
 
-    # ------------------------------------------- etapa 1: retorno do AutoFicha
-    def _on_ficha_finished(self, result: RunResult) -> None:
-        retorno, self._return_file = self._return_file, None
+    # ----------------------------------- etapa 1: retorno do AutoFicha / JMSFicha
+    def _on_ficha_step_finished(self, result: RunResult) -> None:
+        step, self._step = self._step, None
+        nome = step.nome if step is not None else _NOME_ATUAL
+        retorno = step.retorno if step is not None else None
         try:
-            state, detail, pastas = self._avaliar_ficha(result, retorno)
+            state, detail, pastas = self._avaliar_ficha(result, retorno, nome)
         finally:
             discard(retorno)  # o arquivo temporário não sobrevive ao processamento, nem a exceções
+            if step is not None:
+                step.retorno = None
 
+        if state is FichaState.ERRO:
+            # Falhou ou foi cancelada: as etapas seguintes não rodam e nada fica "concluído".
+            if self._acc_pastas:
+                detail += (f"\nEtapas anteriores já salvaram fichas, mas o processamento NÃO foi concluído "
+                           f"e o Excel não será liberado.")
+            self._finish_ficha(state, f"{nome}: {detail}", cancelled=result.status == "cancelled")
+            return
+
+        for pasta in pastas:
+            if all(os.path.normcase(str(pasta)) != os.path.normcase(str(p)) for p in self._acc_pastas):
+                self._acc_pastas.append(pasta)
+        if state is FichaState.SEM_FICHAS:
+            self.run_panel.log.append("info", f"{nome}: nenhuma ficha foi salva nesta etapa.")
+
+        if self._pipeline:  # restam etapas: segue fora do slot do QProcess (evita reentrância)
+            QTimer.singleShot(0, self._start_next_step)
+            return
+        if self._acc_pastas:
+            self._finish_ficha(FichaState.PRONTO, "")
+        else:
+            self._finish_ficha(FichaState.SEM_FICHAS, "Nenhum script salvou fichas.")
+
+    def _finish_ficha(self, state: FichaState, detail: str, cancelled: bool = False,
+                      dialogs: bool = True) -> None:
+        """Encerra a geração das fichas: consolida as pastas, atualiza o estado e avisa o usuário."""
+        self._pipeline = None
+        self._step = None
+        pastas = list(self._acc_pastas) if state is FichaState.PRONTO else []
+        self._acc_pastas = []
         self._pastas = pastas
         self._set_state(state, detail)
         log_ = self.run_panel.log.append
@@ -452,6 +571,8 @@ class RegistrosPage(ModulePage):
         elif detail:
             log_("err" if state is FichaState.ERRO else "info", detail)
 
+        if not dialogs:
+            return
         QApplication.alert(self.window())
         if state is FichaState.PRONTO:
             show_info(self, "Automação concluída",
@@ -459,13 +580,14 @@ class RegistrosPage(ModulePage):
                       f"Use '{_EXCEL_TASK_NAME}' para gerar o Excel dessas pastas.")
         elif state is FichaState.SEM_FICHAS:
             show_warning(self, "Nenhuma ficha gerada", detail)
-        elif result.status == "cancelled":
+        elif cancelled:
             show_warning(self, "Execução cancelada", detail)
         else:
             show_error(self, "Falha na automação", detail,
                        "Consulte a área de log para ver as mensagens do script (stderr).")
 
-    def _avaliar_ficha(self, result: RunResult, retorno: Path | None) -> tuple[FichaState, str, list[Path]]:
+    def _avaliar_ficha(self, result: RunResult, retorno: Path | None,
+                       nome: str = _NOME_ATUAL) -> tuple[FichaState, str, list[Path]]:
         """Decide o estado a partir do código de saída E do JSON. Só devolve PRONTO com retorno válido."""
         parsed: FichaResult | None = None
         read_error = "O arquivo de retorno não foi criado."
@@ -477,29 +599,29 @@ class RegistrosPage(ModulePage):
 
         if parsed is not None:
             for falha in parsed.falhas:
-                self.run_panel.log.append("err", f"Falha informada pelo AutoFicha: {falha}")
+                self.run_panel.log.append("err", f"Falha informada pelo {nome}: {falha}")
 
         if result.status == "cancelled":
             return FichaState.ERRO, "Execução cancelada pelo usuário.", []
         if result.status != "success":
             detail = result.message
             if parsed is not None and parsed.erro:
-                detail += f"\nAutoFicha: {parsed.erro}"
+                detail += f"\n{nome}: {parsed.erro}"
             return FichaState.ERRO, detail, []
         if parsed is None:
             return FichaState.ERRO, (
-                "O AutoFicha terminou, mas o retorno é inválido; "
+                f"O {nome} terminou, mas o retorno é inválido; "
                 f"o botão '{_EXCEL_TASK_NAME}' permanece bloqueado.\n{read_error}"), []
         if not parsed.sucesso:
-            return FichaState.ERRO, parsed.erro or "O AutoFicha informou falha no retorno.", []
+            return FichaState.ERRO, parsed.erro or f"O {nome} informou falha no retorno.", []
         if not parsed.pastas:
-            return FichaState.SEM_FICHAS, "O AutoFicha terminou, mas nenhuma ficha foi salva.", []
+            return FichaState.SEM_FICHAS, f"O {nome} terminou, mas nenhuma ficha foi salva.", []
         return FichaState.PRONTO, "", list(parsed.pastas)
 
     # --------------------------------------------- etapa 2: Gerar Excel das Fichas
     @guarded
     def _on_excel(self) -> None:
-        if self._busy or self._batch is not None:
+        if self._busy or self._batch is not None or self._pipeline is not None:
             return  # nunca duas execuções simultâneas neste módulo
         if self._state not in EXCEL_ENABLED_STATES or not self._pastas:
             raise ValidationError("Execute o AutoFicha com sucesso (ao menos uma ficha salva) "
@@ -589,6 +711,29 @@ class RegistrosPage(ModulePage):
         else:
             show_error(self, "Falha ao gerar o Excel das fichas", summary, details)
 
+    # ------------------------------------------------------- --pasta (inicialização)
+    def apply_pasta_inicial(self, raw: str) -> str:
+        """Aplica a pasta recebida por ``--pasta``: preenche "Pasta específica" e libera o Excel.
+
+        Devolve ``""`` se deu certo ou a mensagem de erro. Com pasta inválida o campo é
+        preenchido mesmo assim (fica destacado em vermelho e ``_on_start`` recusa executar)
+        e o botão do Excel continua bloqueado. Só a Ficha tem a etapa do Excel.
+        """
+        if self.btn_excel is None:
+            return ""
+        try:
+            pasta = validate_directory(raw, "Diretório informado em --pasta")
+        except ValidationError as exc:
+            self.sel_pasta.set_path(str(raw).strip())
+            return str(exc)
+        pasta = pasta.resolve()
+        self.sel_pasta.set_path(str(pasta))
+        self._pastas = [pasta]
+        self._set_state(FichaState.PRONTO, f"Pasta informada em --pasta:\n{pasta}")
+        self.run_panel.log.append(
+            "info", f"Pasta recebida em --pasta: {pasta}. '{_EXCEL_TASK_NAME}' liberado para esta pasta.")
+        return ""
+
     # ---------------------------------------------------------------- estado/UI
     def _set_state(self, state: FichaState, detail: str = "") -> None:
         self._state = state
@@ -597,7 +742,7 @@ class RegistrosPage(ModulePage):
 
     def _sync_ui(self) -> None:
         """Reflete estado + execução na interface (campos, chip e botão do Excel)."""
-        locked = self._busy or self._batch is not None
+        locked = self._busy or self._batch is not None or self._pipeline is not None
         self.inputs.setEnabled(not locked)
         if self.btn_excel is None or self.lbl_estado is None:
             return

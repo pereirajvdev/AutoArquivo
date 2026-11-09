@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from .launch import Launch
+from .models import Registro
+
 
 class FichaState(Enum):
     # (rótulo exibido, estado visual do chip: idle | running | success | error | cancelled)
@@ -30,6 +33,22 @@ class FichaState(Enum):
     @property
     def chip(self) -> str:
         return self.value[1]
+
+
+@dataclass
+class FichaStep:
+    """Uma execução de script de ficha (AutoFicha ou JMSFicha) com os seus registros.
+
+    ``retorno`` é o JSON temporário criado só quando a etapa começa.
+    """
+
+    nome: str
+    key: str
+    registros: list[Registro]
+    launch: Launch
+    servidores: Path
+    pasta: Path | None = None
+    retorno: Path | None = None
 
 
 # Estados em que "Gerar Excel das Fichas" pode ser acionado (desde que haja pastas retornadas).

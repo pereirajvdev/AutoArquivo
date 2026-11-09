@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from ..config import APP_NAME, APP_VERSION, MODULES, ModuleSpec, Settings
 from .base_page import AppContext, ModulePage
-from .dialogs import confirm
+from .dialogs import confirm, show_error
 from .ferias_page import FeriasPage
 from .icons import icon, pixmap, toggle_icon
 from .licencas_page import LicencasPage
@@ -41,7 +41,8 @@ PAGE_FACTORIES: dict[str, Callable[[ModuleSpec, AppContext], ModulePage]] = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, pasta: str | None = None) -> None:
+        """``pasta``: valor de ``--pasta`` recebido na linha de comando (``None`` se ausente)."""
         super().__init__()
         self.settings = settings
         self.setWindowTitle(f"{APP_NAME} — Painel de Automações de RH")
@@ -82,6 +83,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Pronto.")
         self._restore_state()
+        if pasta is not None:
+            self._apply_pasta_inicial(pasta)
 
     # ------------------------------------------------------------ construção
     def _build_sidebar(self) -> QFrame:
@@ -217,6 +220,23 @@ class MainWindow(QMainWindow):
                 log.debug("Geometria da janela inválida; ignorando.")
         last = self.settings.preferences.get("last_module")
         self.show_module(last if last in self.pages else next(iter(self.pages)))
+
+    def _apply_pasta_inicial(self, pasta: str) -> None:
+        """Aplica ``--pasta`` já na inicialização; erro é exibido assim que a janela aparece."""
+        page = self.pages.get("ficha")
+        apply = getattr(page, "apply_pasta_inicial", None)
+        if apply is None:
+            return
+        error = apply(pasta)
+        self.show_module("ficha")
+        if error:
+            log.warning("--pasta inválida: %s", " ".join(error.split()))
+            QTimer.singleShot(0, lambda: show_error(
+                self, "Pasta inválida em --pasta", error,
+                "A execução fica bloqueada até que a pasta seja corrigida ou limpa no campo "
+                "'Pasta específica'."))
+        else:
+            self.statusBar().showMessage(f"Pasta recebida em --pasta: {page.sel_pasta.path()}", 8000)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - API do Qt
         running = [p for p in self.pages.values() if p.is_running]

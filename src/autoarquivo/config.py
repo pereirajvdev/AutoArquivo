@@ -8,6 +8,7 @@ localizados por convenção como *pastas irmãs* do projeto::
     <pasta pai>/AutoFaltas/src/main.py
     <pasta pai>/AutoFérias/src/main.py
     <pasta pai>/FichaPDFToExcel/src/main.py  (etapa posterior ao AutoFicha)
+    <pasta pai>/JMSFicha/main.py             (fichas de 2008 e anteriores)
 
 Qualquer caminho pode ser sobrescrito em "Configurações" e fica salvo em
 ``settings.json`` (``%APPDATA%\\AutoArquivo`` no Windows).
@@ -44,13 +45,18 @@ class ModuleSpec:
     action_text: str = "Executar"
     script_folder: str | None = None  # pasta irmã que contém src/main.py
     export_excel: bool = False  # exibe "Gerar Excel das Fichas" após o sucesso do módulo
+    legacy_script_key: str | None = None  # script auxiliar dos anos anteriores a ANO_CORTE (ver routing.py)
 
+
+# Chaves dos scripts auxiliares (ver EXTRA_SCRIPTS).
+FICHA_EXCEL_KEY = "ficha_excel"
+JMS_FICHA_KEY = "jms_ficha"
 
 # Para incluir um novo módulo: adicione um ModuleSpec aqui e registre a
 # página correspondente em ``ui/main_window.py`` (PAGE_FACTORIES).
 MODULES: tuple[ModuleSpec, ...] = (
     ModuleSpec("ficha", "Ficha", "Geração de fichas financeiras", "file",
-               "Gerar fichas", "AutoFicha", export_excel=True),
+               "Gerar fichas", "AutoFicha", export_excel=True, legacy_script_key=JMS_FICHA_KEY),
     ModuleSpec("faltas", "Faltas", "Levantamento de faltas por servidor", "calendar-x",
                "Processar faltas", "AutoFaltas"),
     ModuleSpec("licencas", "Licenças", "Automação de licenças", "clipboard",
@@ -62,14 +68,18 @@ MODULES_BY_KEY = {m.key: m for m in MODULES}
 
 # Scripts auxiliares: não são módulos de navegação, mas também são executados
 # pelo painel. ``chave -> (pasta irmã, rótulo em Configurações)``.
-FICHA_EXCEL_KEY = "ficha_excel"
 EXTRA_SCRIPTS: dict[str, tuple[str, str]] = {
     FICHA_EXCEL_KEY: ("FichaPDFToExcel", "Ficha → Excel"),
+    JMS_FICHA_KEY: ("JMSFicha", "JMSFicha (2008 e anteriores)"),
+}
+# Caminho do script dentro da pasta irmã, quando difere de ``src/main.py``.
+EXTRA_SCRIPT_RELATIVE: dict[str, Path] = {
+    JMS_FICHA_KEY: Path("main.py"),
 }
 
 
-def _sibling_script(folder: str) -> Path:
-    return WORKSPACE_ROOT / folder / SCRIPT_RELATIVE_PATH
+def _sibling_script(folder: str, relative: Path = SCRIPT_RELATIVE_PATH) -> Path:
+    return WORKSPACE_ROOT / folder / relative
 
 
 def default_script_path(spec: ModuleSpec) -> Path | None:
@@ -82,7 +92,9 @@ def default_script_path(spec: ModuleSpec) -> Path | None:
 def default_extra_script_path(key: str) -> Path | None:
     """Caminho padrão de um script auxiliar (ver ``EXTRA_SCRIPTS``)."""
     extra = EXTRA_SCRIPTS.get(key)
-    return _sibling_script(extra[0]) if extra else None
+    if not extra:
+        return None
+    return _sibling_script(extra[0], EXTRA_SCRIPT_RELATIVE.get(key, SCRIPT_RELATIVE_PATH))
 
 
 def settings_dir() -> Path:
