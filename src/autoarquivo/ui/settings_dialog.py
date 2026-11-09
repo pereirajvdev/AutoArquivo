@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLabel, QVBoxLayout, QWidget
 
-from ..config import MODULES, Settings, default_script_path
+from ..config import (
+    EXTRA_SCRIPTS,
+    MODULES,
+    Settings,
+    default_extra_script_path,
+    default_script_path,
+)
 from .widgets import PathSelector
 
 
@@ -32,18 +38,25 @@ class SettingsDialog(QDialog):
         self.python.set_path(settings.python_interpreter)
         form.addRow("Interpretador Python", self.python)
 
+        # (chave, rótulo, caminho padrão) de cada script configurável
+        entries: list[tuple[str, str, object]] = [
+            (spec.key, spec.title, default_script_path(spec))
+            for spec in MODULES if spec.script_folder
+        ]
+        entries += [
+            (key, label, default_extra_script_path(key))
+            for key, (_folder, label) in EXTRA_SCRIPTS.items()
+        ]
+
         self.scripts: dict[str, PathSelector] = {}
-        for spec in MODULES:
-            if not spec.script_folder:
-                continue
-            default = default_script_path(spec)
+        for key, title, default in entries:
             selector = PathSelector(
-                settings, f"script_{spec.key}", "file", str(default) if default else "",
-                f"Selecionar script do módulo {spec.title}",
+                settings, f"script_{key}", "file", str(default) if default else "",
+                f"Selecionar script do módulo {title}",
                 "Scripts Python (*.py);;Todos os arquivos (*)", clearable=True, button_text="Procurar")
-            selector.set_path(settings.scripts.get(spec.key, ""))
-            self.scripts[spec.key] = selector
-            form.addRow(f"Script — {spec.title}", selector)
+            selector.set_path(settings.scripts.get(key, ""))
+            self.scripts[key] = selector
+            form.addRow(f"Script — {title}", selector)
 
         buttons = QDialogButtonBox()
         save = buttons.addButton("Salvar", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -69,4 +82,3 @@ class SettingsDialog(QDialog):
                 self._settings.scripts.pop(key, None)
         self._settings.save()
         self.accept()
-

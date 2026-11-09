@@ -16,16 +16,20 @@ class RunPanel(Card):
     """Encapsula um :class:`ScriptRunner` e toda a apresentação da execução.
 
     A página dona decide *quando* executar (``startRequested``) e chama
-    :meth:`execute` depois de validar os dados.
+    :meth:`execute` depois de validar os dados. Ao terminar, ``finished`` entrega
+    o :class:`RunResult` para que a página reaja ao resultado.
     """
 
     startRequested = Signal()
     runningChanged = Signal(bool)
+    finished = Signal(object)  # RunResult
 
     def __init__(self, start_text: str = "Iniciar", parent: QWidget | None = None) -> None:
         super().__init__("Execução", "Acompanhe o andamento e o resultado da automação.",
                          "play", parent)
         self.runner = ScriptRunner(self)
+        self._task = ""
+        self._quiet = False
 
         self.btn_start = make_button(start_text, "play", "primary")
         self.btn_cancel = make_button("Cancelar", "stop", "danger", "Interromper a execução")
@@ -66,11 +70,19 @@ class RunPanel(Card):
     def is_running(self) -> bool:
         return self.runner.is_running
 
-    def execute(self, launch: Launch, args: list[str]) -> None:
-        """Inicia o script. Nunca permite duas execuções simultâneas do módulo."""
+    def execute(self, launch: Launch, args: list[str], task: str = "", quiet: bool = False) -> None:
+        """Inicia o script. Nunca permite duas execuções simultâneas do módulo.
+
+        ``task`` (opcional) nomeia a etapa nas mensagens ao usuário, para
+        distinguir execuções diferentes que compartilham este painel.
+        ``quiet`` suprime os diálogos de fim de execução (a página dona passa a
+        mostrar o seu próprio, p.ex. um resumo único após várias execuções em fila).
+        """
         if self.is_running:
             show_warning(self, "Execução em andamento", "Este módulo já está em execução.")
             return
+        self._task = task
+        self._quiet = quiet
         self.log.append("info", "Comando: " + format_command(launch.python, launch.script, args))
         self._set_running(True)
         try:
@@ -125,13 +137,22 @@ class RunPanel(Card):
             self._set_chip("Falhou", "error")
             self.log.append("err", f"{result.message} (código de retorno {code})")
 
+        # A página pode iniciar uma nova execução ao receber o sinal; por isso o
+        # modo e a tarefa desta execução são lidos ANTES de emitir.
+        quiet, task = self._quiet, self._task
+
+        # Avisa a página antes dos diálogos modais, para que ela atualize seus controles.
+        self.finished.emit(result)
+
+        if quiet:
+            return
         QApplication.alert(self.window())  # pisca a barra de tarefas se estiver em segundo plano
+        subject = f"A etapa '{task}'" if task else "A automação"
         if result.status == "success":
-            show_info(self, "Automação concluída", "A automação foi concluída com sucesso.\n"
+            show_info(self, "Automação concluída", f"{subject} foi concluída com sucesso.\n"
                       f"Código de retorno: {code}.")
         elif result.status == "cancelled":
             show_warning(self, "Execução cancelada", result.message)
         else:
             show_error(self, "Falha na automação", result.message,
                        "Consulte a área de log para ver as mensagens do script (stderr).")
-

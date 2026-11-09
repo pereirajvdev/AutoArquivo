@@ -7,6 +7,7 @@ localizados por convenção como *pastas irmãs* do projeto::
     <pasta pai>/AutoFicha/src/main.py
     <pasta pai>/AutoFaltas/src/main.py
     <pasta pai>/AutoFérias/src/main.py
+    <pasta pai>/FichaPDFToExcel/src/main.py  (etapa posterior ao AutoFicha)
 
 Qualquer caminho pode ser sobrescrito em "Configurações" e fica salvo em
 ``settings.json`` (``%APPDATA%\\AutoArquivo`` no Windows).
@@ -42,13 +43,14 @@ class ModuleSpec:
     icon: str
     action_text: str = "Executar"
     script_folder: str | None = None  # pasta irmã que contém src/main.py
+    export_excel: bool = False  # exibe "Gerar Excel das Fichas" após o sucesso do módulo
 
 
 # Para incluir um novo módulo: adicione um ModuleSpec aqui e registre a
 # página correspondente em ``ui/main_window.py`` (PAGE_FACTORIES).
 MODULES: tuple[ModuleSpec, ...] = (
     ModuleSpec("ficha", "Ficha", "Geração de fichas financeiras", "file",
-               "Gerar fichas", "AutoFicha"),
+               "Gerar fichas", "AutoFicha", export_excel=True),
     ModuleSpec("faltas", "Faltas", "Levantamento de faltas por servidor", "calendar-x",
                "Processar faltas", "AutoFaltas"),
     ModuleSpec("licencas", "Licenças", "Automação de licenças", "clipboard",
@@ -58,12 +60,29 @@ MODULES: tuple[ModuleSpec, ...] = (
 )
 MODULES_BY_KEY = {m.key: m for m in MODULES}
 
+# Scripts auxiliares: não são módulos de navegação, mas também são executados
+# pelo painel. ``chave -> (pasta irmã, rótulo em Configurações)``.
+FICHA_EXCEL_KEY = "ficha_excel"
+EXTRA_SCRIPTS: dict[str, tuple[str, str]] = {
+    FICHA_EXCEL_KEY: ("FichaPDFToExcel", "Ficha → Excel"),
+}
+
+
+def _sibling_script(folder: str) -> Path:
+    return WORKSPACE_ROOT / folder / SCRIPT_RELATIVE_PATH
+
 
 def default_script_path(spec: ModuleSpec) -> Path | None:
     """Caminho padrão do script de um módulo (pasta irmã do projeto)."""
     if not spec.script_folder:
         return None
-    return WORKSPACE_ROOT / spec.script_folder / SCRIPT_RELATIVE_PATH
+    return _sibling_script(spec.script_folder)
+
+
+def default_extra_script_path(key: str) -> Path | None:
+    """Caminho padrão de um script auxiliar (ver ``EXTRA_SCRIPTS``)."""
+    extra = EXTRA_SCRIPTS.get(key)
+    return _sibling_script(extra[0]) if extra else None
 
 
 def settings_dir() -> Path:
@@ -128,12 +147,14 @@ class Settings:
 
     # --------------------------------------------------------------- consultas
     def script_path(self, key: str) -> Path | None:
-        """Script do módulo: sobrescrita do usuário ou padrão por convenção."""
+        """Script de um módulo/auxiliar: sobrescrita do usuário ou padrão por convenção."""
         override = self.scripts.get(key, "").strip()
         if override:
             return Path(override)
         spec = MODULES_BY_KEY.get(key)
-        return default_script_path(spec) if spec else None
+        if spec:
+            return default_script_path(spec)
+        return default_extra_script_path(key)
 
     def last_dir(self, key: str) -> str:
         return self.last_dirs.get(key, "")
